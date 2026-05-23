@@ -1,6 +1,12 @@
-const { jsonResponse, corsHeaders, sanitizeString, parseJsonBody } = require("./_lib/http");
+const { sanitizeString } = require("./_lib/http");
 const { upsertMessage } = require("./_lib/supabase");
-const { getEnv } = require("./_lib/env");
+
+const headers = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Content-Type": "application/json",
+};
 
 function validatePayload(payload) {
   if (!payload || typeof payload !== "object") {
@@ -29,89 +35,79 @@ function validatePayload(payload) {
   };
 }
 
-function isAuthorized(event) {
-  const expectedToken = getEnv("COLLECTOR_INGEST_TOKEN", "");
-  if (!expectedToken) return true;
-
-  const headerToken =
-    event?.headers?.["x-collector-token"] ||
-    event?.headers?.["X-Collector-Token"] ||
-    event?.headers?.["x_collector_token"];
-
-  return sanitizeString(headerToken, 512) === expectedToken;
-}
-
 exports.handler = async (event) => {
-  const cors = corsHeaders();
-
   if (event.httpMethod === "OPTIONS") {
     return {
-      statusCode: 204,
-      headers: cors,
-      body: "",
+      statusCode: 200,
+      headers,
+      body: JSON.stringify({
+        ok: true,
+      }),
     };
   }
 
   if (event.httpMethod !== "POST") {
-    return jsonResponse(
-      405,
-      {
-        ok: false,
-        error: "Method not allowed",
-      },
-      cors,
-    );
+    return {
+      statusCode: 405,
+      headers,
+      body: JSON.stringify({
+        error: "Method Not Allowed",
+      }),
+    };
   }
 
-  if (!isAuthorized(event)) {
-    return jsonResponse(
-      401,
-      {
+  let payload;
+
+  try {
+    payload = JSON.parse(event.body);
+  } catch (_error) {
+    return {
+      statusCode: 400,
+      headers,
+      body: JSON.stringify({
         ok: false,
-        error: "Unauthorized",
-      },
-      cors,
-    );
+        error: "Invalid JSON body",
+      }),
+    };
   }
 
-  const payload = parseJsonBody(event);
   const validated = validatePayload(payload);
 
   if (typeof validated === "string") {
-    return jsonResponse(
-      400,
-      {
+    return {
+      statusCode: 400,
+      headers,
+      body: JSON.stringify({
         ok: false,
         error: validated,
-      },
-      cors,
-    );
+      }),
+    };
   }
 
   try {
+    console.log("Incoming message:", validated);
     await upsertMessage(validated);
 
-    return jsonResponse(
-      200,
-      {
-        ok: true,
+    return {
+      statusCode: 200,
+      headers,
+      body: JSON.stringify({
+        success: true,
         id: validated.id,
-      },
-      cors,
-    );
+      }),
+    };
   } catch (error) {
     console.error("Failed to persist benzinga message", {
       error: error?.message || String(error),
       id: validated.id,
     });
 
-    return jsonResponse(
-      500,
-      {
-        ok: false,
-        error: "Failed to persist message",
-      },
-      cors,
-    );
+    return {
+      statusCode: 500,
+      headers,
+      body: JSON.stringify({
+        error: error?.message || "Failed to persist message",
+      }),
+    };
   }
 };

@@ -5,7 +5,7 @@ const processedIds = new Set();
 // TARGET = 5AM PST
 const TARGET_MINUTES = 5 * 60;
 
-const NETLIFY_BASE_URL = "https://YOUR_NETLIFY_SITE.netlify.app";
+const NETLIFY_BASE_URL = "https://benzinga-chat-collector.netlify.app";
 const INGEST_PATH = "/api/benzinga-message";
 const MAX_QUEUE_SIZE = 20000;
 const RETRY_DELAYS_MS = [1500, 5000, 15000, 60000, 180000];
@@ -15,7 +15,6 @@ let pipelineFlushScheduled = false;
 let pipelineFlushing = false;
 let pipelineConfig = {
   baseUrl: NETLIFY_BASE_URL,
-  token: "",
 };
 
 function sanitizeText(value, maxLength = 8000) {
@@ -102,17 +101,11 @@ function schedulePipelineFlush(delayMs) {
 }
 
 async function postToPipeline(entry) {
-  const headers = {
-    "Content-Type": "application/json",
-  };
-
-  if (pipelineConfig.token) {
-    headers["X-Collector-Token"] = pipelineConfig.token;
-  }
-
   const response = await fetch(getIngestUrl(), {
     method: "POST",
-    headers,
+    headers: {
+      "Content-Type": "application/json",
+    },
     body: JSON.stringify(entry.payload),
   });
 
@@ -179,7 +172,7 @@ async function flushPipelineQueue() {
 function loadPipelineState() {
   return new Promise((resolve) => {
     chrome.storage.local.get(
-      ["messagePipelineQueue", "pipelineBaseUrl", "pipelineAuthToken"],
+      ["messagePipelineQueue", "pipelineBaseUrl"],
       (result) => {
         pipelineQueue = Array.isArray(result.messagePipelineQueue)
           ? result.messagePipelineQueue
@@ -190,8 +183,6 @@ function loadPipelineState() {
             typeof result.pipelineBaseUrl === "string" && result.pipelineBaseUrl.trim()
               ? result.pipelineBaseUrl.trim()
               : NETLIFY_BASE_URL,
-          token:
-            typeof result.pipelineAuthToken === "string" ? result.pipelineAuthToken.trim() : "",
         };
 
         pruneQueue();

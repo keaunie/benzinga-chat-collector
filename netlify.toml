@@ -1,0 +1,19 @@
+[build]
+  functions = "netlify/functions"
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
+  status = 200
+
+[functions."generate-12pm-report"]
+  # 12:05 PM Pacific Standard Time (UTC-8)
+  schedule = "5 20 * * *"
+
+[functions."generate-3pm-report"]
+  # 3:05 PM Pacific Standard Time (UTC-8)
+  schedule = "5 23 * * *"
+
+[functions."generate-7pm-report"]
+  # 7:05 PM Pacific Standard Time (UTC-8)
+  schedule = "5 3 * * *"

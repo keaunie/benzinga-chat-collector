@@ -2,349 +2,462 @@ console.log("Benzinga Collector Loaded");
 
 const processedIds = new Set();
 
-// TARGET = 3AM PST
+// TARGET = 5AM PST
 const TARGET_MINUTES = 5 * 60;
 
+const NETLIFY_BASE_URL = "https://YOUR_NETLIFY_SITE.netlify.app";
+const INGEST_PATH = "/api/benzinga-message";
+const MAX_QUEUE_SIZE = 20000;
+const RETRY_DELAYS_MS = [1500, 5000, 15000, 60000, 180000];
+
+let pipelineQueue = [];
+let pipelineFlushScheduled = false;
+let pipelineFlushing = false;
+let pipelineConfig = {
+  baseUrl: NETLIFY_BASE_URL,
+  token: "",
+};
+
+function sanitizeText(value, maxLength = 8000) {
+  if (typeof value !== "string") return "";
+  return value.replace(/\s+/g, " ").trim().slice(0, maxLength);
+}
+
 function parseTimeToMinutes(timeStr) {
+  const match = timeStr.match(/(\d+):(\d+)(AM|PM)/i);
 
-    const match =
-        timeStr.match(/(\d+):(\d+)(AM|PM)/i);
+  if (!match) return null;
 
-    if (!match) return null;
+  let [, h, m, ap] = match;
 
-    let [, h, m, ap] = match;
+  h = parseInt(h);
+  m = parseInt(m);
 
-    h = parseInt(h);
-    m = parseInt(m);
+  if (ap.toUpperCase() === "PM" && h !== 12) {
+    h += 12;
+  }
 
-    if (
-        ap.toUpperCase() === "PM" &&
-        h !== 12
-    ) {
-        h += 12;
+  if (ap.toUpperCase() === "AM" && h === 12) {
+    h = 0;
+  }
+
+  return h * 60 + m;
+}
+
+function getIngestUrl() {
+  const trimmed = (pipelineConfig.baseUrl || NETLIFY_BASE_URL).replace(/\/$/, "");
+  return `${trimmed}${INGEST_PATH}`;
+}
+
+function persistPipelineState() {
+  chrome.storage.local.set({
+    messagePipelineQueue: pipelineQueue,
+  });
+}
+
+function pruneQueue() {
+  if (pipelineQueue.length > MAX_QUEUE_SIZE) {
+    pipelineQueue = pipelineQueue.slice(pipelineQueue.length - MAX_QUEUE_SIZE);
+  }
+}
+
+function enqueueForPipeline(messagePayload) {
+  const entry = {
+    payload: {
+      id: sanitizeText(messagePayload.id, 256),
+      username: sanitizeText(messagePayload.username, 512) || "Unknown",
+      timestamp: sanitizeText(messagePayload.timestamp, 128),
+      message: sanitizeText(messagePayload.message, 8000),
+      capturedAt: messagePayload.capturedAt,
+    },
+    attempts: 0,
+    nextAttemptAt: Date.now(),
+  };
+
+  if (!entry.payload.id || !entry.payload.message) {
+    return;
+  }
+
+  pipelineQueue.push(entry);
+  pruneQueue();
+  persistPipelineState();
+  schedulePipelineFlush(0);
+}
+
+function retryDelayForAttempt(attempt) {
+  return RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)];
+}
+
+function schedulePipelineFlush(delayMs) {
+  if (pipelineFlushScheduled) {
+    return;
+  }
+
+  pipelineFlushScheduled = true;
+
+  setTimeout(() => {
+    pipelineFlushScheduled = false;
+    flushPipelineQueue();
+  }, delayMs);
+}
+
+async function postToPipeline(entry) {
+  const headers = {
+    "Content-Type": "application/json",
+  };
+
+  if (pipelineConfig.token) {
+    headers["X-Collector-Token"] = pipelineConfig.token;
+  }
+
+  const response = await fetch(getIngestUrl(), {
+    method: "POST",
+    headers,
+    body: JSON.stringify(entry.payload),
+  });
+
+  if (!response.ok) {
+    const errBody = await response.text().catch(() => "");
+    const retryable = response.status >= 429 || response.status >= 500;
+    const error = new Error(
+      `Pipeline POST failed (${response.status}) ${retryable ? "retryable" : "non-retryable"}`,
+    );
+    error.retryable = retryable;
+    error.details = errBody;
+    throw error;
+  }
+}
+
+async function flushPipelineQueue() {
+  if (pipelineFlushing) return;
+
+  pipelineFlushing = true;
+
+  try {
+    while (pipelineQueue.length > 0) {
+      const now = Date.now();
+      const current = pipelineQueue[0];
+
+      if (!current || typeof current !== "object") {
+        pipelineQueue.shift();
+        continue;
+      }
+
+      if (current.nextAttemptAt > now) {
+        schedulePipelineFlush(current.nextAttemptAt - now);
+        break;
+      }
+
+      try {
+        await postToPipeline(current);
+        pipelineQueue.shift();
+        persistPipelineState();
+      } catch (error) {
+        current.attempts += 1;
+
+        if (error.retryable) {
+          current.nextAttemptAt = Date.now() + retryDelayForAttempt(current.attempts);
+          persistPipelineState();
+          schedulePipelineFlush(retryDelayForAttempt(current.attempts));
+          break;
+        }
+
+        console.error("Dropping non-retryable pipeline payload", {
+          id: current.payload?.id,
+          error: error?.message,
+          details: error?.details,
+        });
+        pipelineQueue.shift();
+        persistPipelineState();
+      }
     }
+  } finally {
+    pipelineFlushing = false;
+  }
+}
 
-    if (
-        ap.toUpperCase() === "AM" &&
-        h === 12
-    ) {
-        h = 0;
-    }
+function loadPipelineState() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(
+      ["messagePipelineQueue", "pipelineBaseUrl", "pipelineAuthToken"],
+      (result) => {
+        pipelineQueue = Array.isArray(result.messagePipelineQueue)
+          ? result.messagePipelineQueue
+          : [];
 
-    return h * 60 + m;
+        pipelineConfig = {
+          baseUrl:
+            typeof result.pipelineBaseUrl === "string" && result.pipelineBaseUrl.trim()
+              ? result.pipelineBaseUrl.trim()
+              : NETLIFY_BASE_URL,
+          token:
+            typeof result.pipelineAuthToken === "string" ? result.pipelineAuthToken.trim() : "",
+        };
+
+        pruneQueue();
+        resolve();
+      },
+    );
+  });
 }
 
 function extractMessages() {
+  const messages = document.querySelectorAll("li.str-chat__li");
 
-    const messages =
-        document.querySelectorAll(
-            'li.str-chat__li'
-        );
+  messages.forEach((msg) => {
+    try {
+      const messageId = msg.getAttribute("data-message-id");
 
-    messages.forEach((msg) => {
+      if (!messageId) return;
 
-        try {
+      if (processedIds.has(messageId)) {
+        return;
+      }
 
-            // UNIQUE MESSAGE ID
-            const messageId =
-                msg.getAttribute(
-                    "data-message-id"
-                );
+      processedIds.add(messageId);
 
-            if (!messageId) return;
+      const userEl = msg.querySelector(".str-chat__message-team-author");
 
-            // AVOID DUPLICATES
-            if (
-                processedIds.has(messageId)
-            ) {
-                return;
-            }
+      const username = userEl?.innerText?.trim() || "Unknown";
 
-            processedIds.add(messageId);
+      const timeEl = msg.querySelector("time");
 
-            // USERNAME
-            const userEl =
-                msg.querySelector(
-                    '.str-chat__message-team-author'
-                );
+      const timestamp =
+        timeEl?.innerText?.trim() || new Date().toLocaleTimeString();
 
-            const username =
-                userEl?.innerText?.trim()
-                || "Unknown";
+      const textEl = msg.querySelector(
+        '[data-testid="message-team-message"] p',
+      );
 
-            // TIMESTAMP
-            const timeEl =
-                msg.querySelector("time");
+      const message = textEl?.innerText?.trim();
 
-            const timestamp =
-                timeEl?.innerText?.trim()
-                || new Date()
-                    .toLocaleTimeString();
+      if (!message) return;
 
-            // MESSAGE TEXT
-            const textEl =
-                msg.querySelector(
-                    '[data-testid="message-team-message"] p'
-                );
+      const payload = {
+        id: messageId,
+        username,
+        timestamp,
+        message,
+        capturedAt: new Date().toISOString(),
+      };
 
-            const message =
-                textEl?.innerText?.trim();
+      console.log("CHAT MESSAGE:", payload);
 
-            if (!message) return;
+      chrome.storage.local.get(["messages"], (result) => {
+        const storedMessages = result.messages || [];
 
-            const payload = {
-                id: messageId,
-                username,
-                timestamp,
-                message,
-                capturedAt:
-                    new Date().toISOString()
-            };
+        storedMessages.push(payload);
 
-            console.log(
-                "CHAT MESSAGE:",
-                payload
-            );
+        chrome.storage.local.set({
+          messages: storedMessages,
+        });
+      });
 
-            // SAVE LOCALLY
-            chrome.storage.local.get(
-                ["messages"],
-                (result) => {
-
-                    const messages =
-                        result.messages || [];
-
-                    messages.push(payload);
-
-                    chrome.storage.local.set({
-                        messages
-                    });
-                }
-            );
-
-        } catch (err) {
-
-            console.error(err);
-        }
-    });
+      enqueueForPipeline(payload);
+    } catch (err) {
+      console.error(err);
+    }
+  });
 }
 
-function getScrollContainer() {
+async function getScrollContainer() {
+  let retries = 0;
 
-    // FIND THE CHAT AREA
-    const chatMessages =
-        document.querySelector(
-            'li.str-chat__li'
-        );
+  while (retries < 30) {
+    const chatMessages = document.querySelector("li.str-chat__li");
 
-    if (!chatMessages) {
+    if (chatMessages) {
+      console.log("Chat messages loaded");
 
-        console.error(
-            "No chat messages found"
-        );
+      let parent = chatMessages.parentElement;
 
-        return null;
-    }
-
-    let parent =
-        chatMessages.parentElement;
-
-    // WALK UP DOM TREE
-    while (parent) {
-
-        const style =
-            getComputedStyle(parent);
+      while (parent) {
+        const style = getComputedStyle(parent);
 
         const isScrollable =
-            (
-                style.overflowY === 'auto' ||
-                style.overflowY === 'scroll'
-            ) &&
-            parent.scrollHeight >
-            parent.clientHeight;
+          (style.overflowY === "auto" || style.overflowY === "scroll") &&
+          parent.scrollHeight > parent.clientHeight;
 
         if (isScrollable) {
+          console.log("SCROLL CONTAINER FOUND:", parent);
 
-            console.log(
-                "SCROLL CONTAINER FOUND:",
-                parent
-            );
-
-            return parent;
+          return parent;
         }
 
-        parent =
-            parent.parentElement;
+        parent = parent.parentElement;
+      }
     }
 
-    return null;
+    retries++;
+
+    console.log("Waiting for scroll container...");
+
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+
+  return null;
 }
 
-async function backreadTo3AM() {
+async function backreadToTarget() {
+  console.log("Starting backread...");
 
-    console.log(
-        "Starting backread..."
-    );
+  let reachedTarget = false;
 
-    const scrollContainer =
-        getScrollContainer();
+  let attempts = 0;
+
+  while (!reachedTarget && attempts < 300) {
+    attempts++;
+
+    const scrollContainer = await getScrollContainer();
 
     if (!scrollContainer) {
+      console.error("Lost scroll container");
 
-        console.error(
-            "Scrollable container not found"
-        );
-
-        return;
+      break;
     }
 
-    console.log(
-        "FOUND SCROLL CONTAINER:",
-        scrollContainer
-    );
+    extractMessages();
 
-    let reachedTarget = false;
+    const messages = document.querySelectorAll("li.str-chat__li");
 
-    let attempts = 0;
+    let oldestMinutes = null;
 
-    while (
-        !reachedTarget &&
-        attempts < 100
-    ) {
+    let oldestMessageData = null;
 
-        attempts++;
+    messages.forEach((msg) => {
+      const timeEl = msg.querySelector("time");
 
-        // EXTRACT CURRENTLY LOADED
-        extractMessages();
+      const timestamp = timeEl?.innerText?.trim();
 
-        const messages =
-            document.querySelectorAll(
-                'li.str-chat__li'
-            );
+      if (!timestamp) return;
 
-        let oldestMinutes = null;
+      const mins = parseTimeToMinutes(timestamp);
 
-        messages.forEach(msg => {
+      if (mins !== null) {
+        if (oldestMinutes === null || mins < oldestMinutes) {
+          oldestMinutes = mins;
 
-            const timeEl =
-                msg.querySelector("time");
+          const textEl = msg.querySelector(
+            '[data-testid="message-team-message"] p',
+          );
 
-            const timestamp =
-                timeEl?.innerText?.trim();
+          const message = textEl?.innerText?.trim() || "No message";
 
-            if (!timestamp) return;
+          const userEl = msg.querySelector(".str-chat__message-team-author");
 
-            const mins =
-                parseTimeToMinutes(
-                    timestamp
-                );
+          const username = userEl?.innerText?.trim() || "Unknown";
 
-            if (mins !== null) {
-
-                if (
-                    oldestMinutes === null ||
-                    mins < oldestMinutes
-                ) {
-
-                    oldestMinutes = mins;
-                }
-            }
-        });
-
-        console.log(
-            "Oldest loaded message:",
-            oldestMinutes
-        );
-
-        // STOP AT 3AM
-        if (
-            oldestMinutes !== null &&
-            oldestMinutes <= TARGET_MINUTES
-        ) {
-
-            console.log(
-                "Reached 3AM PST"
-            );
-
-            reachedTarget = true;
-
-            break;
+          oldestMessageData = {
+            username,
+            timestamp,
+            message,
+          };
         }
-
-        // FORCE SCROLL TO TOP
-        scrollContainer.scrollTop = 0;
-
-        console.log(
-            "Scrolling upward..."
-        );
-
-        // WAIT FOR LAZY LOAD
-        await new Promise(r =>
-            setTimeout(r, 3000)
-        );
-    }
-
-    console.log(
-        "Backread complete"
-    );
-}
-
-// WATCH FOR NEW LIVE MESSAGES
-const observer =
-    new MutationObserver(() => {
-
-        extractMessages();
+      }
     });
 
-async function initializeCollector() {
+    console.log("Oldest loaded message:", oldestMessageData);
 
-    console.log(
-        "Waiting for Benzinga chat..."
-    );
+    console.table([oldestMessageData]);
 
-    let retries = 0;
+    // STOP AT TARGET TIME
+    if (oldestMinutes !== null && oldestMinutes <= TARGET_MINUTES) {
+      console.log("Reached target time");
 
-    while (retries < 60) {
+      reachedTarget = true;
 
-        const chatLoaded =
-            document.querySelector(
-                'li.str-chat__li'
-            );
-
-        if (chatLoaded) {
-
-            console.log(
-                "Chat detected. Starting collector..."
-            );
-
-            // START OBSERVER
-            observer.observe(
-                document.body,
-                {
-                    childList: true,
-                    subtree: true
-                }
-            );
-
-            // INITIAL EXTRACTION
-            extractMessages();
-
-            // START BACKREAD
-            backreadTo3AM();
-
-            return;
-        }
-
-        retries++;
-
-        await new Promise(r =>
-            setTimeout(r, 1000)
-        );
+      break;
     }
 
-    console.error(
-        "Chat failed to load after waiting."
-    );
+    // TOP MESSAGE BEFORE
+    const firstMessageBefore = document
+      .querySelector("li.str-chat__li")
+      ?.getAttribute("data-message-id");
+
+    console.log("Top message before:", firstMessageBefore);
+
+    // FORCE SCROLL UP
+    scrollContainer.scrollTop = 0;
+
+    console.log("Scrolling upward...");
+
+    let loaded = false;
+
+    // WAIT FOR OLDER MESSAGES
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+
+      // KEEP PUSHING UP
+      scrollContainer.scrollTop = 0;
+
+      // NEW TOP MESSAGE
+      const firstMessageAfter = document
+        .querySelector("li.str-chat__li")
+        ?.getAttribute("data-message-id");
+
+      console.log("Top message after:", firstMessageAfter);
+
+      // OLDER HISTORY LOADED
+      if (firstMessageAfter && firstMessageAfter !== firstMessageBefore) {
+        console.log("Older messages loaded");
+
+        loaded = true;
+
+        break;
+      }
+
+      console.log("Waiting for older messages...");
+    }
+
+    // NO MORE HISTORY
+    if (!loaded) {
+      console.log("No more older messages found");
+
+      break;
+    }
+  }
+
+  console.log("Backread complete");
+}
+
+// WATCH LIVE MESSAGES
+const observer = new MutationObserver(() => {
+  extractMessages();
+});
+
+async function initializeCollector() {
+  await loadPipelineState();
+
+  schedulePipelineFlush(0);
+
+  console.log("Waiting for Benzinga chat...");
+
+  let retries = 0;
+
+  while (retries < 60) {
+    const chatLoaded = document.querySelector("li.str-chat__li");
+
+    if (chatLoaded) {
+      console.log("Chat detected. Starting collector...");
+
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+      });
+
+      extractMessages();
+
+      backreadToTarget();
+
+      return;
+    }
+
+    retries++;
+
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+
+  console.error("Chat failed to load after waiting.");
 }
 
 initializeCollector();

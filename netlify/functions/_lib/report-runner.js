@@ -1,41 +1,136 @@
 const { getMessagesInWindow, claimReportRun, updateReportById } = require("./supabase");
-const { getPacificWindowUtc } = require("./time");
-const { generateReportAnalysis } = require("./openai");
+const { getPacificWindowUtc, shouldRunAtPacificSchedule } = require("./time");
+const { generateMarketIntelligenceReport } = require("./openai");
 const { sendWhatsAppReport } = require("./whatsapp");
+const { buildSnapshot } = require("./report-intelligence");
 
 function buildReportId({ reportType, dateKey }) {
   return `${dateKey}-${reportType}`;
 }
 
-function buildNoDataReport({ reportType, windowStartIso, windowEndIso, generatedAtIso }) {
+function topSentimentLabel(sentiment) {
+  if (sentiment.bullish > sentiment.bearish) return "bullish";
+  if (sentiment.bearish > sentiment.bullish) return "bearish";
+  return "neutral";
+}
+
+function buildFallbackReport({ reportName, generatedAtIso, snapshot }) {
+  const topTickers = snapshot.top_tickers.slice(0, 8);
+  const highConviction = snapshot.high_conviction_trades.slice(0, 8);
+  const matt = snapshot.matt_messages.slice(0, 8);
+  const optionsFlow = snapshot.options_flow.slice(0, 8);
+  const macroThemes = snapshot.macro_themes;
+
   return [
-    "BENZINGA INNER CIRCLE REPORT",
-    `${reportType.toUpperCase()} | Generated: ${generatedAtIso}`,
+    "BENZINGA MARKET INTELLIGENCE REPORT",
+    "",
+    "DATE + TIME",
+    `${reportName} | Generated: ${generatedAtIso}`,
     "",
     "MARKET SENTIMENT",
-    "No messages available for this window.",
+    `Overall: ${topSentimentLabel(snapshot.sentiment)} (bullish=${snapshot.sentiment.bullish}, bearish=${snapshot.sentiment.bearish}, neutral=${snapshot.sentiment.neutral})`,
     "",
-    "MOST DISCUSSED TICKERS",
-    "No data.",
-    "",
-    "HIGH CONVICTION TRADES",
-    "No data.",
+    "TOP TICKERS",
+    ...(topTickers.length
+      ? topTickers.map(
+          (row) =>
+            `- ${row.ticker}: mentions=${row.mentions}, sentiment=${row.dominant_sentiment}, conviction=${row.conviction}`,
+        )
+      : ["- No high-signal ticker concentration detected."]),
     "",
     "MATT MALEY COMMENTARY",
-    "Not present in this message window.",
+    ...(matt.length
+      ? matt.map((row) => `- ${row.message}`)
+      : ["- No MMaley messages in this window."]),
+    "",
+    "HIGH CONVICTION TRADES",
+    ...(highConviction.length
+      ? highConviction.map(
+          (row) =>
+            `- ${row.username} | signal=${row.signal_strength} | tickers=${(row.mentioned_tickers || []).join(",") || "none"} | ${row.message}`,
+        )
+      : ["- No high conviction trades identified."]),
     "",
     "OPTIONS FLOW",
-    "No unusual options flow detected from available messages.",
+    ...(optionsFlow.length
+      ? optionsFlow.map(
+          (row) =>
+            `- ${row.username} | ${row.sentiment} | tickers=${(row.mentioned_tickers || []).join(",") || "none"} | ${row.message}`,
+        )
+      : ["- No unusual options flow detected."]),
+    "",
+    "MACRO THEMES",
+    `- Rates: ${macroThemes.rates}`,
+    `- Oil: ${macroThemes.oil}`,
+    `- Geopolitics: ${macroThemes.geopolitics}`,
+    `- Fed: ${macroThemes.fed}`,
+    `- Risk Appetite: ${macroThemes.risk_appetite}`,
     "",
     "KEY TAKEAWAYS",
-    `No Benzinga messages were stored for ${windowStartIso} to ${windowEndIso}.`,
+    `- Actionable messages: ${snapshot.totals.analyzed_messages} out of ${snapshot.totals.raw_messages}`,
+    `- Matt messages: ${snapshot.totals.matt_messages}`,
+    "- Use this fallback report only when AI generation is unavailable.",
   ].join("\n");
 }
 
-async function runScheduledReport({ reportType, endHourPacific, now = new Date() }) {
-  const generatedAtIso = now.toISOString();
-  const { startIso, endIso, dateKey } = getPacificWindowUtc(now, 5, endHourPacific);
+function buildNoDataReport({ reportName, generatedAtIso, windowStartIso, windowEndIso }) {
+  return [
+    "BENZINGA MARKET INTELLIGENCE REPORT",
+    "",
+    "DATE + TIME",
+    `${reportName} | Generated: ${generatedAtIso}`,
+    "",
+    "MARKET SENTIMENT",
+    "No messages available for this report window.",
+    "",
+    "TOP TICKERS",
+    "No data.",
+    "",
+    "MATT MALEY COMMENTARY",
+    "No MMaley messages in this report window.",
+    "",
+    "HIGH CONVICTION TRADES",
+    "No high conviction setups found.",
+    "",
+    "OPTIONS FLOW",
+    "No options flow signals found.",
+    "",
+    "MACRO THEMES",
+    "No macro themes detected.",
+    "",
+    "KEY TAKEAWAYS",
+    `No messages were stored from ${windowStartIso} to ${windowEndIso}.`,
+  ].join("\n");
+}
 
+async function runScheduledReport({
+  reportType,
+  reportName,
+  endHourPacific,
+  scheduledHourPacific,
+  now = new Date(),
+}) {
+  const generatedAtIso = now.toISOString();
+
+  if (typeof scheduledHourPacific === "number") {
+    const scheduleCheck = shouldRunAtPacificSchedule({
+      now,
+      targetHour: scheduledHourPacific,
+      targetMinute: 5,
+      minuteTolerance: 15,
+    });
+
+    if (!scheduleCheck.ok) {
+      return {
+        skipped: true,
+        reason: "schedule_guard",
+        details: scheduleCheck.reason,
+        pacific: scheduleCheck.pacific,
+      };
+    }
+  }
+
+  const { startIso, endIso, dateKey } = getPacificWindowUtc(now, 5, endHourPacific);
   const reportId = buildReportId({ reportType, dateKey });
 
   const claimed = await claimReportRun({
@@ -57,28 +152,42 @@ async function runScheduledReport({ reportType, endHourPacific, now = new Date()
 
   try {
     const messages = await getMessagesInWindow(startIso, endIso);
+    const snapshot = buildSnapshot(messages);
 
     let reportText;
-    if (messages.length === 0) {
+    let reportMode = "ai";
+
+    if (snapshot.totals.raw_messages === 0) {
       reportText = buildNoDataReport({
-        reportType,
-        windowStartIso: startIso,
-        windowEndIso: endIso,
+        reportName,
         generatedAtIso,
-      });
-    } else {
-      reportText = await generateReportAnalysis({
-        reportType,
         windowStartIso: startIso,
         windowEndIso: endIso,
-        messages,
       });
+      reportMode = "no_data";
+    } else {
+      try {
+        reportText = await generateMarketIntelligenceReport({
+          reportType,
+          windowStartIso: startIso,
+          windowEndIso: endIso,
+          snapshot,
+        });
+      } catch (error) {
+        console.error("AI report generation failed, using fallback report", error);
+        reportText = buildFallbackReport({
+          reportName,
+          generatedAtIso,
+          snapshot,
+        });
+        reportMode = "fallback";
+      }
     }
 
     const twilioResult = await sendWhatsAppReport(reportText);
 
     await updateReportById(reportId, {
-      message_count: messages.length,
+      message_count: snapshot.totals.raw_messages,
       report_text: reportText,
       status: "sent",
       sent_at: new Date().toISOString(),
@@ -88,7 +197,10 @@ async function runScheduledReport({ reportType, endHourPacific, now = new Date()
     return {
       skipped: false,
       reportId,
-      messageCount: messages.length,
+      reportMode,
+      messageCount: snapshot.totals.raw_messages,
+      analyzedCount: snapshot.totals.analyzed_messages,
+      mattCount: snapshot.totals.matt_messages,
       startIso,
       endIso,
       twilio: twilioResult,

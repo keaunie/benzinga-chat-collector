@@ -1,53 +1,5 @@
 const { getEnv, assertEnv, REQUIRED_ENV_BY_FEATURE } = require("./env");
 
-function buildMessageDigest(messages) {
-  const maxMessages = 1200;
-  const selected = messages.slice(-maxMessages);
-
-  return selected
-    .map((row) => {
-      const at = row.captured_at || "";
-      const user = row.username || "Unknown";
-      const timestamp = row.timestamp_text || "";
-      const msg = row.message || "";
-      return `[${at}] ${user} (${timestamp}): ${msg}`;
-    })
-    .join("\n");
-}
-
-function buildPrompt({ reportType, windowStartIso, windowEndIso, messages }) {
-  const digest = buildMessageDigest(messages);
-
-  return [
-    "You are an institutional-grade market intelligence analyst.",
-    "Summarize Benzinga Inner Circle chat messages into actionable trading intelligence.",
-    "Avoid generic language. Focus on conviction, theme repetition, and sentiment shifts.",
-    "Output plain text markdown sections with exactly these headers:",
-    "1) BENZINGA INNER CIRCLE REPORT",
-    "2) MARKET SENTIMENT",
-    "3) MOST DISCUSSED TICKERS",
-    "4) HIGH CONVICTION TRADES",
-    "5) MATT MALEY COMMENTARY",
-    "6) OPTIONS FLOW",
-    "7) KEY TAKEAWAYS",
-    "",
-    `Report type: ${reportType}`,
-    `Window UTC: ${windowStartIso} to ${windowEndIso}`,
-    `Total messages: ${messages.length}`,
-    "",
-    "Include:",
-    "- Bullish and bearish sentiment overview with confidence language",
-    "- Most discussed tickers with mention count and sentiment",
-    "- Unusual calls/puts and options flow clues from chat",
-    "- Macro/risk appetite discussions",
-    "- Matt Maley commentary summary if present, otherwise explicitly state not present",
-    "- Repeated market themes and possible tactical setups",
-    "",
-    "Message digest:",
-    digest,
-  ].join("\n");
-}
-
 function extractTextFromResponse(json) {
   if (typeof json?.output_text === "string" && json.output_text.trim()) {
     return json.output_text.trim();
@@ -74,11 +26,98 @@ function extractTextFromResponse(json) {
   return "";
 }
 
-async function generateReportAnalysis({ reportType, windowStartIso, windowEndIso, messages }) {
+function truncate(str, limit) {
+  const value = String(str || "");
+  if (value.length <= limit) return value;
+  return `${value.slice(0, limit - 3)}...`;
+}
+
+function buildPriorityDigest(snapshot) {
+  const priority = [];
+
+  const combined = [
+    ...snapshot.matt_messages,
+    ...snapshot.high_conviction_trades,
+    ...snapshot.options_flow.slice(-20),
+    ...snapshot.macro_messages.slice(-20),
+  ];
+
+  const seen = new Set();
+
+  for (const row of combined) {
+    if (!row || !row.id || seen.has(row.id)) continue;
+    seen.add(row.id);
+
+    priority.push(
+      `[${row.captured_at}] ${row.username} | type=${row.message_type} | sentiment=${row.sentiment} | signal=${row.signal_strength} | tickers=${(row.mentioned_tickers || []).join(",") || "none"} | ${truncate(row.message, 220)}`,
+    );
+
+    if (priority.length >= 250) {
+      break;
+    }
+  }
+
+  return priority.join("\n");
+}
+
+function buildPrompt({ reportType, windowStartIso, windowEndIso, snapshot }) {
+  const sentiment = snapshot.sentiment;
+  const topTickersCompact = snapshot.top_tickers.slice(0, 15).map((ticker) => ({
+    ticker: ticker.ticker,
+    mentions: ticker.mentions,
+    sentiment: ticker.dominant_sentiment,
+    conviction: ticker.conviction,
+  }));
+
+  const contextPayload = {
+    report_type: reportType,
+    window_start_utc: windowStartIso,
+    window_end_utc: windowEndIso,
+    totals: snapshot.totals,
+    sentiment,
+    top_tickers: topTickersCompact,
+    macro_themes: snapshot.macro_themes,
+    matt_message_count: snapshot.matt_messages.length,
+    high_conviction_count: snapshot.high_conviction_trades.length,
+    options_flow_count: snapshot.options_flow.length,
+    notable_contributors: snapshot.notable_contributors,
+  };
+
+  return [
+    "You are an institutional trading intelligence analyst.",
+    "Produce a high-signal report from Benzinga Inner Circle chat.",
+    "",
+    "Output must use these exact section headers:",
+    "BENZINGA MARKET INTELLIGENCE REPORT",
+    "DATE + TIME",
+    "MARKET SENTIMENT",
+    "TOP TICKERS",
+    "MATT MALEY COMMENTARY",
+    "HIGH CONVICTION TRADES",
+    "OPTIONS FLOW",
+    "MACRO THEMES",
+    "KEY TAKEAWAYS",
+    "",
+    "Requirements:",
+    "- Prioritize actionable trade intelligence over general commentary.",
+    "- Include MMaley commentary even if sparse; explicitly mention if absent.",
+    "- Include mentions/sentiment/conviction for top tickers.",
+    "- Filter out low-value chatter unless directly market-relevant.",
+    "- Keep concise, concrete, and trade-desk ready.",
+    "",
+    "Structured context JSON:",
+    JSON.stringify(contextPayload, null, 2),
+    "",
+    "Priority message digest:",
+    buildPriorityDigest(snapshot),
+  ].join("\n");
+}
+
+async function generateMarketIntelligenceReport({ reportType, windowStartIso, windowEndIso, snapshot }) {
   assertEnv(REQUIRED_ENV_BY_FEATURE.openai, "openai");
 
   const model = getEnv("OPENAI_MODEL", "gpt-5");
-  const prompt = buildPrompt({ reportType, windowStartIso, windowEndIso, messages });
+  const prompt = buildPrompt({ reportType, windowStartIso, windowEndIso, snapshot });
 
   const response = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -99,7 +138,7 @@ async function generateReportAnalysis({ reportType, windowStartIso, windowEndIso
           ],
         },
       ],
-      max_output_tokens: 2500,
+      max_output_tokens: 2600,
     }),
   });
 
@@ -119,5 +158,5 @@ async function generateReportAnalysis({ reportType, windowStartIso, windowEndIso
 }
 
 module.exports = {
-  generateReportAnalysis,
+  generateMarketIntelligenceReport,
 };

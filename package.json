@@ -5,8 +5,8 @@
   "description": "Benzinga chat collector extension + Netlify intelligence pipeline",
   "scripts": {
     "netlify:dev": "netlify dev",
-    "functions:12pm": "netlify functions:invoke generate-12pm-report",
-    "functions:3pm": "netlify functions:invoke generate-3pm-report",
-    "functions:7pm": "netlify functions:invoke generate-7pm-report"
+    "functions:open-market": "netlify functions:invoke generate-open-market-report",
+    "functions:midday": "netlify functions:invoke generate-midday-report",
+    "functions:endofday": "netlify functions:invoke generate-endofday-report"
   }
 }

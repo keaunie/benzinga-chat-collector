@@ -1,5 +1,6 @@
 const { getEnv, assertEnv, REQUIRED_ENV_BY_FEATURE } = require("./env");
 const { sanitizeString } = require("./http");
+const { classifyMessage } = require("./classification");
 
 const TABLE_MESSAGES = "benzinga_messages";
 const TABLE_REPORTS = "benzinga_reports";
@@ -58,6 +59,8 @@ async function supabaseFetch(path, init = {}) {
 }
 
 function toSupabaseMessageRow(input) {
+  const classification = classifyMessage(input);
+
   return {
     id: sanitizeString(input.id, 256),
     username: sanitizeString(input.username, 512),
@@ -65,6 +68,13 @@ function toSupabaseMessageRow(input) {
     message: sanitizeString(input.message, 8000),
     captured_at: new Date(input.capturedAt).toISOString(),
     source: sanitizeString(input.source || "benzinga-extension", 128),
+    message_type: sanitizeString(classification.message_type, 64),
+    sentiment: sanitizeString(classification.sentiment, 32),
+    mentioned_tickers: classification.mentioned_tickers,
+    is_matt_message: Boolean(classification.is_matt_message),
+    signal_strength: Number(classification.signal_strength || 1),
+    ai_summary: sanitizeString(classification.ai_summary, 2000),
+    trading_day: classification.trading_day,
   };
 }
 
@@ -92,7 +102,7 @@ async function getMessagesInWindow(startIso, endIso) {
 
   while (hasMore) {
     const query =
-      `/${TABLE_MESSAGES}?select=id,username,timestamp_text,message,captured_at,source` +
+      `/${TABLE_MESSAGES}?select=id,username,timestamp_text,message,captured_at,source,message_type,sentiment,mentioned_tickers,is_matt_message,signal_strength,ai_summary,trading_day` +
       `&captured_at=gte.${encodeURIComponent(startIso)}` +
       `&captured_at=lte.${encodeURIComponent(endIso)}` +
       `&order=captured_at.asc` +

@@ -82,8 +82,40 @@ function getPacificWindowUtc(date, startHour, endHour) {
   };
 }
 
+function shouldRunAtPacificSchedule({
+  now = new Date(),
+  targetHour,
+  targetMinute = 5,
+  minuteTolerance = 7,
+}) {
+  const pacific = getPacificDateParts(now);
+
+  if (pacific.hour !== targetHour) {
+    return {
+      ok: false,
+      reason: `hour_mismatch expected=${targetHour} actual=${pacific.hour}`,
+      pacific,
+    };
+  }
+
+  const minuteDelta = Math.abs(pacific.minute - targetMinute);
+  if (minuteDelta > minuteTolerance) {
+    return {
+      ok: false,
+      reason: `minute_window_mismatch expected~=${targetMinute} actual=${pacific.minute}`,
+      pacific,
+    };
+  }
+
+  return {
+    ok: true,
+    pacific,
+  };
+}
+
 module.exports = {
   PACIFIC_TIME_ZONE,
   getPacificDateParts,
   getPacificWindowUtc,
+  shouldRunAtPacificSchedule,
 };

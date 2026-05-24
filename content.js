@@ -5,7 +5,7 @@ const processedIds = new Set();
 // TARGET = 5AM PST
 const TARGET_MINUTES = 5 * 60;
 
-const NETLIFY_BASE_URL = "https://benzinga-chat-collector.netlify.app";
+const NETLIFY_BASE_URL = "https://autotradingbenzinga.netlify.app";
 const INGEST_PATH = "/api/benzinga-message";
 const MAX_QUEUE_SIZE = 20000;
 const RETRY_DELAYS_MS = [1500, 5000, 15000, 60000, 180000];
@@ -20,6 +20,49 @@ let pipelineConfig = {
 function sanitizeText(value, maxLength = 8000) {
   if (typeof value !== "string") return "";
   return value.replace(/\s+/g, " ").trim().slice(0, maxLength);
+}
+
+const MAX_USERNAME_LOOKBACK_SIBLINGS = 80;
+
+function extractDirectUsername(messageNode) {
+  const userEl = messageNode?.querySelector(".str-chat__message-team-author");
+  return sanitizeText(userEl?.innerText || "", 512);
+}
+
+function resolveUsername(messageNode, options = {}) {
+  const { log = true } = options;
+
+  const directUsername = extractDirectUsername(messageNode);
+  if (directUsername) {
+    if (log) {
+      console.log("Resolved username:", directUsername);
+    }
+    return directUsername;
+  }
+
+  let sibling = messageNode?.previousElementSibling || null;
+  let traversed = 0;
+
+  while (sibling && traversed < MAX_USERNAME_LOOKBACK_SIBLINGS) {
+    if (typeof sibling.matches === "function" && sibling.matches("li.str-chat__li")) {
+      const inheritedUsername = extractDirectUsername(sibling);
+      if (inheritedUsername) {
+        if (log) {
+          console.log("Inherited username from previous group:", inheritedUsername);
+          console.log("Resolved username:", inheritedUsername);
+        }
+        return inheritedUsername;
+      }
+    }
+
+    sibling = sibling.previousElementSibling;
+    traversed += 1;
+  }
+
+  if (log) {
+    console.log("Resolved username:", "Unknown");
+  }
+  return "Unknown";
 }
 
 function parseTimeToMinutes(timeStr) {
@@ -207,9 +250,7 @@ function extractMessages() {
 
       processedIds.add(messageId);
 
-      const userEl = msg.querySelector(".str-chat__message-team-author");
-
-      const username = userEl?.innerText?.trim() || "Unknown";
+      const username = resolveUsername(msg);
 
       const timeEl = msg.querySelector("time");
 
@@ -334,9 +375,9 @@ async function backreadToTarget() {
 
           const message = textEl?.innerText?.trim() || "No message";
 
-          const userEl = msg.querySelector(".str-chat__message-team-author");
-
-          const username = userEl?.innerText?.trim() || "Unknown";
+          const username = resolveUsername(msg, {
+            log: false,
+          });
 
           oldestMessageData = {
             username,
